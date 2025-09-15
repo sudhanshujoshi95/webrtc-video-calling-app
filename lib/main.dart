@@ -328,10 +328,13 @@ class _VideoCallPageState extends State<VideoCallPage> {
     if (!await requestPermissions()) return;
 
     myUsername = username;
-    socket = IO.io("http://localhost:9000", {
-      "transports": ["websocket"],
-      "autoConnect": false,
-    });
+    socket = IO.io(
+      "https://webrtc-signaling-server-backend.onrender.com", // your live backend URL
+      {
+        "transports": ["websocket"],
+        "autoConnect": false,
+      },
+    );
 
     socket!.connect();
 
