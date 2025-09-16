@@ -1,8 +1,9 @@
+import 'dart:convert';
 import 'dart:developer';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart' as webrtc;
-import 'package:socket_io_client/socket_io_client.dart' as IO;
+import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 void main() {
@@ -17,11 +18,11 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        primaryColor: const Color(0xFF2196F3), // Soft blue
-        scaffoldBackgroundColor: const Color(0xFFF8FAFC), // Light gray
+        primaryColor: const Color(0xFF2196F3),
+        scaffoldBackgroundColor: const Color(0xFFF8FAFC),
         colorScheme: const ColorScheme.light(
           primary: Color(0xFF2196F3),
-          secondary: Color(0xFFFF6F61), // Coral accent
+          secondary: Color(0xFF4CAF50),
           surface: Colors.white,
           onPrimary: Colors.white,
           onSurface: Colors.black87,
@@ -50,16 +51,6 @@ class MyApp extends StatelessWidget {
           hintStyle: TextStyle(color: Colors.grey[400]),
           prefixIconColor: Colors.grey[600],
         ),
-        textTheme: const TextTheme(
-          bodyLarge: TextStyle(fontSize: 16, color: Colors.black87),
-          bodyMedium: TextStyle(fontSize: 14, color: Colors.black54),
-          headlineSmall: TextStyle(
-            fontSize: 20,
-            fontWeight: FontWeight.w600,
-            color: Colors.black87,
-          ),
-          titleMedium: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
-        ),
         cardTheme: CardThemeData(
           elevation: 3,
           shape: RoundedRectangleBorder(
@@ -68,36 +59,52 @@ class MyApp extends StatelessWidget {
           shadowColor: Colors.black12,
         ),
       ),
-      home: const VideoCallPage(),
+      home: const TelemedicineCallPage(),
     );
   }
 }
 
-class VideoCallPage extends StatefulWidget {
-  const VideoCallPage({super.key});
+class TelemedicineCallPage extends StatefulWidget {
+  const TelemedicineCallPage({super.key});
 
   @override
-  State<VideoCallPage> createState() => _VideoCallPageState();
+  State<TelemedicineCallPage> createState() => _TelemedicineCallPageState();
 }
 
-class _VideoCallPageState extends State<VideoCallPage> {
-  final TextEditingController _usernameController = TextEditingController();
+class _TelemedicineCallPageState extends State<TelemedicineCallPage> {
+  // Connection details
+  final TextEditingController _hospitalIdController = TextEditingController(
+    text: 'hospital123',
+  );
+  final TextEditingController _userIdController = TextEditingController(
+    text: 'doctor_john',
+  );
+  final TextEditingController _roleController = TextEditingController(
+    text: 'doctor',
+  );
+  final TextEditingController _usernameController = TextEditingController(
+    text: 'doctor_john',
+  );
   final TextEditingController _targetController = TextEditingController();
 
-  IO.Socket? socket;
-  String? myUsername;
+  // WebSocket and connection state
+  WebSocketChannel? _channel;
   bool connected = false;
+  bool registered = false;
+  String? socketId;
 
+  // Call state
+  bool incomingCall = false;
+  String incomingFrom = "";
+  Map<String, dynamic>? incomingOffer;
+  bool inCall = false;
+  bool offerSent = false;
+
+  // WebRTC components
   webrtc.RTCPeerConnection? _peerConnection;
   webrtc.MediaStream? _localStream;
   final webrtc.RTCVideoRenderer _localRenderer = webrtc.RTCVideoRenderer();
   final webrtc.RTCVideoRenderer _remoteRenderer = webrtc.RTCVideoRenderer();
-
-  bool incomingCall = false;
-  String incomingFrom = "";
-  String? _incomingOfferSdp;
-  bool inCall = false;
-  bool _offerSent = false;
 
   List<webrtc.RTCIceCandidate> _remoteCandidatesQueue = [];
 
@@ -112,15 +119,10 @@ class _VideoCallPageState extends State<VideoCallPage> {
       await _localRenderer.initialize();
       await _remoteRenderer.initialize();
       log("✅ Renderers initialized");
-      if (kIsWeb) {
-        log("🌐 Running on web platform");
-      }
       setState(() {});
     } catch (e) {
       log("❌ Error initializing renderers: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Error initializing video renderers: $e")),
-      );
+      _showSnackBar("Error initializing video renderers: $e");
     }
   }
 
@@ -133,13 +135,10 @@ class _VideoCallPageState extends State<VideoCallPage> {
     final granted =
         statuses[Permission.camera]!.isGranted &&
         statuses[Permission.microphone]!.isGranted;
+
     if (!granted) {
       log("❌ Camera or microphone permissions denied");
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Camera and microphone permissions are required"),
-        ),
-      );
+      _showSnackBar("Camera and microphone permissions are required");
     } else {
       log("✅ Camera and microphone permissions granted");
     }
@@ -171,22 +170,19 @@ class _VideoCallPageState extends State<VideoCallPage> {
 
       if (_localStream != null) {
         _localRenderer.srcObject = _localStream;
-
         _localStream!.getTracks().forEach((track) {
           track.enabled = true;
           log("📹 Track enabled: ${track.kind} - ${track.id}");
         });
 
         log(
-          "✅ Local stream opened with tracks: ${_localStream?.getTracks().map((t) => '${t.kind} (enabled: ${t.enabled}, id: ${t.id})').join(', ')}",
+          "✅ Local stream opened with tracks: ${_localStream?.getTracks().map((t) => '${t.kind} (enabled: ${t.enabled})').join(', ')}",
         );
         setState(() {});
       }
     } catch (e) {
       log("❌ Failed to open user media: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Failed to access camera/microphone: $e")),
-      );
+      _showSnackBar("Failed to access camera/microphone: $e");
     }
   }
 
@@ -218,16 +214,12 @@ class _VideoCallPageState extends State<VideoCallPage> {
         _localStream!.getTracks().forEach((track) {
           track.enabled = true;
           _peerConnection!.addTrack(track, _localStream!);
-          log(
-            "➡️ Added track to peer connection: ${track.kind} (enabled: ${track.enabled})",
-          );
+          log("➡️ Added track to peer connection: ${track.kind}");
         });
       }
 
       _peerConnection!.onTrack = (event) {
         log("📡 onTrack event received");
-        log("📡 Event streams count: ${event.streams.length}");
-
         if (event.streams.isNotEmpty) {
           final remoteStream = event.streams[0];
           log(
@@ -236,9 +228,7 @@ class _VideoCallPageState extends State<VideoCallPage> {
 
           remoteStream.getTracks().forEach((track) {
             track.enabled = true;
-            log(
-              "📡 Remote track: ${track.kind} (enabled: ${track.enabled}, id: ${track.id})",
-            );
+            log("📡 Remote track: ${track.kind} (enabled: ${track.enabled})");
           });
 
           setState(() {
@@ -247,12 +237,10 @@ class _VideoCallPageState extends State<VideoCallPage> {
           });
 
           if (kIsWeb) {
-            Future.delayed(Duration(milliseconds: 500), () {
+            Future.delayed(const Duration(milliseconds: 500), () {
               setState(() {});
             });
           }
-        } else {
-          log("⚠️ onTrack called but no streams provided");
         }
       };
 
@@ -267,9 +255,7 @@ class _VideoCallPageState extends State<VideoCallPage> {
                 webrtc
                     .RTCIceConnectionState
                     .RTCIceConnectionStateDisconnected) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Connection failed. Try again.")),
-          );
+          _showSnackBar("Connection failed. Try again.");
           hangUp();
         }
         if (state ==
@@ -279,218 +265,269 @@ class _VideoCallPageState extends State<VideoCallPage> {
         }
       };
 
-      _peerConnection!.onSignalingState = (state) {
-        log("📶 Signaling State: $state");
-      };
-
       _peerConnection!.onIceCandidate = (candidate) {
         if (candidate != null &&
-            socket != null &&
+            _channel != null &&
             _targetController.text.isNotEmpty) {
-          socket!.emit("candidate", {
-            "target": _targetController.text,
-            "candidate": {
-              "candidate": candidate.candidate,
-              "sdpMid": candidate.sdpMid,
-              "sdpMLineIndex": candidate.sdpMLineIndex,
+          _sendMessage({
+            'type': 'telemedicine_candidate',
+            'target': _targetController.text,
+            'from': _usernameController.text,
+            'candidate': {
+              'candidate': candidate.candidate,
+              'sdpMid': candidate.sdpMid,
+              'sdpMLineIndex': candidate.sdpMLineIndex,
             },
-            "from": myUsername,
           });
           log("➡️ ICE candidate sent to ${_targetController.text}");
         }
       };
     } catch (e) {
       log("❌ Failed to create peer connection: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Failed to create peer connection: $e")),
-      );
+      _showSnackBar("Failed to create peer connection: $e");
     }
   }
 
-  bool isValidUsername(String username) {
-    return username.isNotEmpty &&
-        username.length >= 3 &&
-        RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(username);
-  }
+  void connectToServer() async {
+    if (!await requestPermissions()) return;
 
-  void connectToServer(String username) async {
-    if (!isValidUsername(username)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            "Username must be at least 3 characters and contain only letters, numbers, or underscores",
-          ),
-        ),
-      );
+    final hospitalId = _hospitalIdController.text;
+    final userId = _userIdController.text;
+    final role = _roleController.text;
+
+    if (hospitalId.isEmpty || userId.isEmpty || role.isEmpty) {
+      _showSnackBar("Please fill in all connection fields");
       return;
     }
 
-    if (!await requestPermissions()) return;
+    try {
+      // Updated URLs based on your backend documentation
+      final wsUrl =
+          'wss://devbackend.medoc.app/hospital/ws?hospitalId=$hospitalId&userId=$userId&role=$role';
 
-    myUsername = username;
-    socket = IO.io(
-      "https://webrtc-signaling-server-backend.onrender.com", // your live backend URL
-      {
-        "transports": ["websocket"],
-        "autoConnect": false,
-      },
-    );
+      log("🔗 Connecting to: $wsUrl");
 
-    socket!.connect();
+      // Add connection timeout and better error handling
+      _channel = WebSocketChannel.connect(
+        Uri.parse(wsUrl),
+        protocols: ['websocket'], // Specify WebSocket protocol
+      );
 
-    socket!.onConnect((_) async {
+      // Wait for connection to establish before setting connected=true
+      await _channel!.ready.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          throw Exception('Connection timeout - server may be unreachable');
+        },
+      );
+
       setState(() => connected = true);
-      log("✅ Connected to signaling server: ${socket!.id}");
+      log("✅ Successfully connected to telemedicine server");
 
-      socket!.emit("register", username);
-      log("📡 Registered as $username");
+      _channel!.stream.listen(
+        (message) {
+          log("📨 Raw message received: $message");
+          try {
+            final data = jsonDecode(message);
+            _handleMessage(data);
+          } catch (e) {
+            log("❌ Error parsing message: $e");
+            log("Raw message was: $message");
+          }
+        },
+        onError: (error) {
+          log("❌ WebSocket error: $error");
+          _showSnackBar("Connection error: $error");
+          setState(() {
+            connected = false;
+            registered = false;
+          });
+        },
+        onDone: () {
+          log("🔴 WebSocket connection closed");
+          setState(() {
+            connected = false;
+            registered = false;
+          });
+          _resetCallState();
+        },
+      );
+
+      // Auto-register after connection is confirmed
+      _registerForTelemedicine();
 
       await openUserMedia();
       if (_localStream != null) {
         await createPeerConnection();
-      } else {
-        log("❌ Cannot create peer connection: local stream is null");
       }
-    });
+    } catch (e) {
+      log("❌ Failed to connect: $e");
+      _showSnackBar("Failed to connect: $e");
+      setState(() {
+        connected = false;
+        registered = false;
+      });
+    }
+  }
 
-    socket!.on("offer", (data) async {
-      final fromUser = data['from'];
-      final sdp = data['sdp'];
-      log("📩 Received offer from $fromUser");
+  void _registerForTelemedicine() {
+    if (_channel == null) return;
 
-      if (inCall || _offerSent) {
-        log("⚠️ Ignoring offer: already in call or offer sent");
-        socket!.emit("reject", {"target": fromUser, "from": myUsername});
-        return;
-      }
+    final username = _usernameController.text;
+    if (username.isEmpty) {
+      _showSnackBar("Please enter a username");
+      return;
+    }
 
-      try {
-        if (_peerConnection == null) {
-          log("🔄 Creating new peer connection for incoming offer");
-          await openUserMedia();
-          if (_localStream != null) {
-            await createPeerConnection();
-          } else {
-            log("❌ Cannot process offer: local stream is null");
-            socket!.emit("reject", {"target": fromUser, "from": myUsername});
-            return;
-          }
-        }
+    _sendMessage({'type': 'telemedicine_register', 'username': username});
 
-        await _peerConnection!.setRemoteDescription(
-          webrtc.RTCSessionDescription(sdp, 'offer'),
-        );
-        log("✅ Remote description set for offer");
+    log("📡 Registering for telemedicine as: $username");
+  }
 
+  void _sendMessage(Map<String, dynamic> message) {
+    if (_channel != null) {
+      _channel!.sink.add(jsonEncode(message));
+    }
+  }
+
+  void _handleMessage(Map<String, dynamic> message) {
+    log("📩 Received message: ${message['type']}");
+
+    switch (message['type']) {
+      case 'telemedicine_registered':
         setState(() {
-          incomingCall = true;
-          incomingFrom = fromUser;
-          _incomingOfferSdp = sdp;
-          _targetController.text = fromUser;
+          registered = true;
+          socketId = message['socketId'];
         });
+        log("✅ Registered for telemedicine: ${message['username']}");
+        _showSnackBar("Successfully registered as ${message['username']}");
+        break;
 
-        await _processQueuedCandidates();
-      } catch (e) {
-        log("❌ Error processing offer: $e");
-        socket!.emit("reject", {"target": fromUser, "from": myUsername});
-      }
-    });
+      case 'telemedicine_offer':
+        _handleIncomingOffer(message);
+        break;
 
-    socket!.on("answer", (data) async {
-      final sdp = data['sdp'];
-      log("📩 Received answer from ${data['from']}");
+      case 'telemedicine_answer':
+        _handleIncomingAnswer(message);
+        break;
 
-      try {
-        if (_peerConnection != null) {
-          await _peerConnection!.setRemoteDescription(
-            webrtc.RTCSessionDescription(sdp, 'answer'),
-          );
-          log("✅ Remote description set for answer");
+      case 'telemedicine_candidate':
+        _handleIncomingCandidate(message);
+        break;
 
-          await _processQueuedCandidates();
-        }
-      } catch (e) {
-        log("❌ Error setting remote description for answer: $e");
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text("Error processing answer: $e")));
-      }
-    });
+      case 'telemedicine_reject':
+        log("❌ Call rejected by ${message['from']}");
+        _showSnackBar("Call rejected by ${message['from']}");
+        _resetCallState();
+        break;
 
-    socket!.on("candidate", (data) async {
-      final candidateData = data['candidate'];
-      if (candidateData != null) {
-        final candidate = webrtc.RTCIceCandidate(
-          candidateData['candidate'],
-          candidateData['sdpMid'],
-          candidateData['sdpMLineIndex'],
-        );
-        log("📩 Received ICE candidate from ${data['from']}");
+      case 'telemedicine_error':
+        log("❌ Server error: ${message['message']}");
+        _showSnackBar("Error: ${message['message']}");
+        break;
 
-        if (_peerConnection != null &&
-            _peerConnection!.getRemoteDescription() != null) {
-          try {
-            await _peerConnection!.addCandidate(candidate);
-            log("✅ ICE candidate added immediately");
-          } catch (e) {
-            log("❌ Error adding ICE candidate: $e");
-          }
+      default:
+        log("⚠️ Unknown message type: ${message['type']}");
+    }
+  }
+
+  Future<void> _handleIncomingOffer(Map<String, dynamic> data) async {
+    final fromUser = data['from'];
+    final sdp = data['sdp'];
+
+    log("📩 Received offer from $fromUser");
+
+    if (inCall || offerSent) {
+      log("⚠️ Ignoring offer: already in call or offer sent");
+      _sendMessage({
+        'type': 'telemedicine_reject',
+        'target': fromUser,
+        'from': _usernameController.text,
+      });
+      return;
+    }
+
+    try {
+      if (_peerConnection == null) {
+        log("🔄 Creating new peer connection for incoming offer");
+        await openUserMedia();
+        if (_localStream != null) {
+          await createPeerConnection();
         } else {
-          _remoteCandidatesQueue.add(candidate);
-          log(
-            "🟡 ICE candidate queued (${_remoteCandidatesQueue.length} total)",
-          );
+          log("❌ Cannot process offer: local stream is null");
+          _sendMessage({
+            'type': 'telemedicine_reject',
+            'target': fromUser,
+            'from': _usernameController.text,
+          });
+          return;
         }
       }
-    });
 
-    socket!.on("reject", (data) {
-      final fromUser = data['from'];
-      log("❌ Call rejected by $fromUser");
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text("Call rejected by $fromUser")));
-      _resetCallState();
-    });
-
-    socket!.on("hangup", (data) {
-      final fromUser = data['from'];
-      log("📴 Call hung up by $fromUser");
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => AlertDialog(
-          title: const Text("Call Ended"),
-          content: Text(
-            "The call with $fromUser has ended, $myUsername. Hope you enjoyed the experience!",
-            style: const TextStyle(fontSize: 16),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                _resetCallState();
-              },
-              child: const Text("OK"),
-            ),
-          ],
-        ),
+      await _peerConnection!.setRemoteDescription(
+        webrtc.RTCSessionDescription(sdp, 'offer'),
       );
-      hangUp();
-    });
+      log("✅ Remote description set for offer");
 
-    socket!.on("error", (data) {
-      log("❌ Server error: ${data['message']}");
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Server error: ${data['message']}")),
+      setState(() {
+        incomingCall = true;
+        incomingFrom = fromUser;
+        incomingOffer = data;
+        _targetController.text = fromUser;
+      });
+
+      await _processQueuedCandidates();
+    } catch (e) {
+      log("❌ Error processing offer: $e");
+      _sendMessage({
+        'type': 'telemedicine_reject',
+        'target': fromUser,
+        'from': _usernameController.text,
+      });
+    }
+  }
+
+  Future<void> _handleIncomingAnswer(Map<String, dynamic> data) async {
+    final sdp = data['sdp'];
+    log("📩 Received answer from ${data['from']}");
+
+    try {
+      if (_peerConnection != null) {
+        await _peerConnection!.setRemoteDescription(
+          webrtc.RTCSessionDescription(sdp, 'answer'),
+        );
+        log("✅ Remote description set for answer");
+        await _processQueuedCandidates();
+      }
+    } catch (e) {
+      log("❌ Error setting remote description for answer: $e");
+      _showSnackBar("Error processing answer: $e");
+    }
+  }
+
+  Future<void> _handleIncomingCandidate(Map<String, dynamic> data) async {
+    final candidateData = data['candidate'];
+    if (candidateData != null) {
+      final candidate = webrtc.RTCIceCandidate(
+        candidateData['candidate'],
+        candidateData['sdpMid'],
+        candidateData['sdpMLineIndex'],
       );
-    });
+      log("📩 Received ICE candidate from ${data['from']}");
 
-    socket!.onDisconnect((_) {
-      setState(() => connected = false);
-      log("🔴 Disconnected from server");
-      hangUp();
-    });
+      if (_peerConnection != null &&
+          _peerConnection!.getRemoteDescription() != null) {
+        try {
+          await _peerConnection!.addCandidate(candidate);
+          log("✅ ICE candidate added immediately");
+        } catch (e) {
+          log("❌ Error adding ICE candidate: $e");
+        }
+      } else {
+        _remoteCandidatesQueue.add(candidate);
+        log("🟡 ICE candidate queued (${_remoteCandidatesQueue.length} total)");
+      }
+    }
   }
 
   Future<void> _processQueuedCandidates() async {
@@ -512,24 +549,17 @@ class _VideoCallPageState extends State<VideoCallPage> {
   void _resetCallState() {
     setState(() {
       _targetController.clear();
-      _incomingOfferSdp = null;
+      incomingOffer = null;
       incomingCall = false;
       inCall = false;
-      _offerSent = false;
+      offerSent = false;
       incomingFrom = "";
     });
   }
 
   Future<void> sendOffer() async {
-    if (_targetController.text.isEmpty || inCall || _offerSent) {
+    if (_targetController.text.isEmpty || inCall || offerSent) {
       log("⚠️ Cannot call: no target, already in call, or offer already sent");
-      return;
-    }
-
-    if (!isValidUsername(_targetController.text)) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text("Invalid target username")));
       return;
     }
 
@@ -546,19 +576,18 @@ class _VideoCallPageState extends State<VideoCallPage> {
 
       await _peerConnection!.setLocalDescription(offer);
 
-      socket!.emit("offer", {
-        "target": _targetController.text,
-        "sdp": offer.sdp,
-        "from": myUsername,
+      _sendMessage({
+        'type': 'telemedicine_offer',
+        'target': _targetController.text,
+        'from': _usernameController.text,
+        'sdp': offer.sdp,
       });
 
       log("➡️ Sent offer to ${_targetController.text}");
-      setState(() => _offerSent = true);
+      setState(() => offerSent = true);
     } catch (e) {
       log("❌ Error sending offer: $e");
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text("Failed to send offer: $e")));
+      _showSnackBar("Failed to send offer: $e");
     }
   }
 
@@ -579,10 +608,11 @@ class _VideoCallPageState extends State<VideoCallPage> {
 
       await _peerConnection!.setLocalDescription(answer);
 
-      socket!.emit("answer", {
-        "target": fromUser,
-        "sdp": answer.sdp,
-        "from": myUsername,
+      _sendMessage({
+        'type': 'telemedicine_answer',
+        'target': fromUser,
+        'from': _usernameController.text,
+        'sdp': answer.sdp,
       });
 
       log("✅ Sent answer to $fromUser");
@@ -594,20 +624,22 @@ class _VideoCallPageState extends State<VideoCallPage> {
       });
 
       await _processQueuedCandidates();
-
-      _incomingOfferSdp = null;
+      incomingOffer = null;
     } catch (e) {
       log("❌ Error answering call: $e");
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text("Failed to answer call: $e")));
+      _showSnackBar("Failed to answer call: $e");
     }
   }
 
   void rejectCall() {
     if (incomingFrom.isEmpty) return;
 
-    socket!.emit("reject", {"target": incomingFrom, "from": myUsername});
+    _sendMessage({
+      'type': 'telemedicine_reject',
+      'target': incomingFrom,
+      'from': _usernameController.text,
+    });
+
     log("❌ Call rejected from $incomingFrom");
     _resetCallState();
   }
@@ -626,10 +658,11 @@ class _VideoCallPageState extends State<VideoCallPage> {
     _localRenderer.srcObject = null;
     _remoteRenderer.srcObject = null;
 
-    if (socket != null && _targetController.text.isNotEmpty) {
-      socket!.emit("hangup", {
-        "target": _targetController.text,
-        "from": myUsername,
+    if (_channel != null && _targetController.text.isNotEmpty) {
+      _sendMessage({
+        'type': 'telemedicine_reject',
+        'target': _targetController.text,
+        'from': _usernameController.text,
       });
     }
 
@@ -638,27 +671,30 @@ class _VideoCallPageState extends State<VideoCallPage> {
 
     log("✅ Call ended and cleaned up");
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text("Call Ended"),
-        content: Text(
-          "The call has ended, $myUsername. Hope you enjoyed the experience!",
-          style: const TextStyle(fontSize: 16),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-            },
-            child: const Text("OK"),
+    // Show dialog
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          title: const Text("Call Ended"),
+          content: const Text(
+            "The call has ended. Hope you enjoyed the experience!",
           ),
-        ],
-      ),
-    );
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text("OK"),
+            ),
+          ],
+        ),
+      );
+    }
 
-    if (_localStream == null && connected) {
+    // Reinitialize for next call
+    if (connected && mounted) {
       await openUserMedia();
       if (_localStream != null) {
         await createPeerConnection();
@@ -666,14 +702,35 @@ class _VideoCallPageState extends State<VideoCallPage> {
     }
   }
 
+  void _showSnackBar(String message) {
+    if (mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
+  void disconnect() {
+    _channel?.sink.close();
+    hangUp();
+    setState(() {
+      connected = false;
+      registered = false;
+      socketId = null;
+    });
+  }
+
   @override
   void dispose() {
     _localStream?.getTracks().forEach((track) => track.stop());
     _localStream?.dispose();
     _peerConnection?.close();
-    socket?.dispose();
+    _channel?.sink.close();
     _localRenderer.dispose();
     _remoteRenderer.dispose();
+    _hospitalIdController.dispose();
+    _userIdController.dispose();
+    _roleController.dispose();
     _usernameController.dispose();
     _targetController.dispose();
     super.dispose();
@@ -684,15 +741,14 @@ class _VideoCallPageState extends State<VideoCallPage> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          myUsername != null ? "Welcome, $myUsername!" : "Video Connect",
+          registered
+              ? "Telemedicine - ${_usernameController.text}"
+              : "Telemedicine Call",
         ),
         flexibleSpace: Container(
           decoration: const BoxDecoration(
             gradient: LinearGradient(
-              colors: [
-                Color(0xFF2196F3),
-                Color(0xFF64B5F6),
-              ], // Light blue gradient
+              colors: [Color(0xFF2196F3), Color(0xFF64B5F6)],
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
             ),
@@ -705,7 +761,7 @@ class _VideoCallPageState extends State<VideoCallPage> {
             child: Row(
               children: [
                 Text(
-                  connected ? "Online" : "Offline",
+                  connected ? "Connected" : "Disconnected",
                   style: const TextStyle(color: Colors.white70),
                 ),
                 const SizedBox(width: 8),
@@ -738,6 +794,7 @@ class _VideoCallPageState extends State<VideoCallPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // Connection Card
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(16.0),
@@ -745,68 +802,116 @@ class _VideoCallPageState extends State<VideoCallPage> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        "Join the Call${myUsername != null ? ", $myUsername" : ""}",
+                        "Connection Setup",
                         style: Theme.of(context).textTheme.headlineSmall,
                       ),
                       const SizedBox(height: 16),
                       TextField(
-                        controller: _usernameController,
+                        controller: _hospitalIdController,
                         decoration: const InputDecoration(
-                          labelText: "Your Username",
-                          prefixIcon: Icon(Icons.person_outline),
+                          labelText: "Hospital ID",
+                          prefixIcon: Icon(Icons.local_hospital),
                         ),
+                        enabled: !connected,
                       ),
                       const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        child: ElevatedButton(
-                          onPressed: connected
-                              ? null
-                              : () {
-                                  if (_usernameController.text.isNotEmpty) {
-                                    connectToServer(_usernameController.text);
-                                  } else {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text(
-                                          "Please enter a username",
-                                        ),
-                                      ),
-                                    );
-                                  }
-                                },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: connected
-                                ? Colors.grey[300]
-                                : Theme.of(context).colorScheme.primary,
-                            foregroundColor: connected
-                                ? Colors.black54
-                                : Colors.white,
+                      TextField(
+                        controller: _userIdController,
+                        decoration: const InputDecoration(
+                          labelText: "User ID",
+                          prefixIcon: Icon(Icons.badge),
+                        ),
+                        enabled: !connected,
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _roleController,
+                        decoration: const InputDecoration(
+                          labelText: "Role (doctor/patient)",
+                          prefixIcon: Icon(Icons.person),
+                        ),
+                        enabled: !connected,
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _usernameController,
+                        decoration: const InputDecoration(
+                          labelText: "Username for telemedicine",
+                          prefixIcon: Icon(Icons.person_outline),
+                        ),
+                        enabled: !connected,
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: ElevatedButton(
+                              onPressed: connected ? null : connectToServer,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: connected
+                                    ? Colors.grey[300]
+                                    : Theme.of(context).colorScheme.primary,
+                                foregroundColor: connected
+                                    ? Colors.black54
+                                    : Colors.white,
+                              ),
+                              child: Text(connected ? "Connected" : "Connect"),
+                            ),
                           ),
-                          child: Text(
-                            connected
-                                ? "Connected as $myUsername"
-                                : "Connect & Register",
+                          const SizedBox(width: 12),
+                          ElevatedButton(
+                            onPressed: connected ? disconnect : null,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.redAccent,
+                              foregroundColor: Colors.white,
+                            ),
+                            child: const Text("Disconnect"),
+                          ),
+                        ],
+                      ),
+                      if (registered) ...[
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.green[50],
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.green[200]!),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.check_circle,
+                                color: Colors.green[600],
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                "Registered for telemedicine",
+                                style: TextStyle(
+                                  color: Colors.green[700],
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                      ),
+                      ],
                     ],
                   ),
                 ),
               ),
               const SizedBox(height: 16),
+
+              // Call Controls Card
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(16.0),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text(
+                      Text(
                         "Make a Call",
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w600,
-                        ),
+                        style: Theme.of(context).textTheme.headlineSmall,
                       ),
                       const SizedBox(height: 16),
                       TextField(
@@ -815,8 +920,9 @@ class _VideoCallPageState extends State<VideoCallPage> {
                           labelText: "Target Username",
                           prefixIcon: Icon(Icons.call_outlined),
                         ),
+                        enabled: registered && !inCall && !offerSent,
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 16),
                       if (_targetController.text.isNotEmpty && inCall)
                         Padding(
                           padding: const EdgeInsets.only(bottom: 12),
@@ -829,62 +935,33 @@ class _VideoCallPageState extends State<VideoCallPage> {
                           ),
                         ),
                       Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                         children: [
-                          ElevatedButton.icon(
-                            onPressed: (connected && !inCall && !_offerSent)
-                                ? sendOffer
-                                : null,
-                            icon: const Icon(Icons.videocam),
-                            label: const Text("Call"),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Theme.of(
-                                context,
-                              ).colorScheme.secondary,
-                              foregroundColor: Colors.white,
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              onPressed: (registered && !inCall && !offerSent)
+                                  ? sendOffer
+                                  : null,
+                              icon: const Icon(Icons.videocam),
+                              label: const Text("Call"),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Theme.of(
+                                  context,
+                                ).colorScheme.secondary,
+                                foregroundColor: Colors.white,
+                              ),
                             ),
                           ),
-                          ElevatedButton.icon(
-                            onPressed: (inCall || _offerSent) ? hangUp : null,
-                            icon: const Icon(Icons.call_end),
-                            label: const Text("Hang Up"),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.redAccent,
-                              foregroundColor: Colors.white,
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              onPressed: (inCall || offerSent) ? hangUp : null,
+                              icon: const Icon(Icons.call_end),
+                              label: const Text("Hang Up"),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.redAccent,
+                                foregroundColor: Colors.white,
+                              ),
                             ),
-                          ),
-                          ElevatedButton.icon(
-                            onPressed: () {
-                              log("🔍 === DEBUG INFO ===");
-                              log("Platform: ${kIsWeb ? 'Web' : 'Native'}");
-                              log("Connected: $connected");
-                              log("In Call: $inCall");
-                              log("Offer Sent: $_offerSent");
-                              log("Local stream: ${_localStream?.id}");
-                              log(
-                                "Remote renderer stream: ${_remoteRenderer.srcObject?.id}",
-                              );
-                              log(
-                                "Local tracks: ${_localStream?.getTracks().map((t) => '${t.kind}(${t.enabled})').join(', ')}",
-                              );
-                              log(
-                                "Remote tracks: ${_remoteRenderer.srcObject?.getTracks().map((t) => '${t.kind}(${t.enabled})').join(', ')}",
-                              );
-                              log(
-                                "PC Signaling: ${_peerConnection?.signalingState}",
-                              );
-                              log(
-                                "PC ICE: ${_peerConnection?.iceConnectionState}",
-                              );
-                              log(
-                                "PC Connection: ${_peerConnection?.connectionState}",
-                              );
-                              log(
-                                "Queued candidates: ${_remoteCandidatesQueue.length}",
-                              );
-                            },
-                            icon: const Icon(Icons.bug_report),
-                            label: const Text("Debug"),
                           ),
                         ],
                       ),
@@ -893,9 +970,12 @@ class _VideoCallPageState extends State<VideoCallPage> {
                 ),
               ),
               const SizedBox(height: 16),
+
+              // Video Streams
               Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // Local Video
                   Expanded(
                     child: Card(
                       child: Padding(
@@ -935,7 +1015,7 @@ class _VideoCallPageState extends State<VideoCallPage> {
                             ),
                             const SizedBox(height: 8),
                             Text(
-                              "${myUsername ?? 'Me'} (You)",
+                              "${_usernameController.text.isNotEmpty ? _usernameController.text : 'Me'} (You)",
                               style: Theme.of(context).textTheme.titleMedium,
                             ),
                           ],
@@ -944,6 +1024,7 @@ class _VideoCallPageState extends State<VideoCallPage> {
                     ),
                   ),
                   const SizedBox(width: 16),
+                  // Remote Video
                   Expanded(
                     child: Card(
                       child: Padding(
@@ -1008,15 +1089,94 @@ class _VideoCallPageState extends State<VideoCallPage> {
                   ),
                 ],
               ),
+
+              const SizedBox(height: 16),
+
+              // Debug Info Card
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "Debug Information",
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 12),
+                      ElevatedButton.icon(
+                        onPressed: () {
+                          log("🔍 === DEBUG INFO ===");
+                          log("Platform: ${kIsWeb ? 'Web' : 'Native'}");
+                          log("Connected: $connected");
+                          log("Registered: $registered");
+                          log("Socket ID: $socketId");
+                          log("In Call: $inCall");
+                          log("Offer Sent: $offerSent");
+                          log("Local stream: ${_localStream?.id}");
+                          log(
+                            "Remote renderer stream: ${_remoteRenderer.srcObject?.id}",
+                          );
+                          log(
+                            "Local tracks: ${_localStream?.getTracks().map((t) => '${t.kind}(${t.enabled})').join(', ')}",
+                          );
+                          log(
+                            "Remote tracks: ${_remoteRenderer.srcObject?.getTracks().map((t) => '${t.kind}(${t.enabled})').join(', ')}",
+                          );
+                          log(
+                            "PC Signaling: ${_peerConnection?.signalingState}",
+                          );
+                          log("PC ICE: ${_peerConnection?.iceConnectionState}");
+                          log(
+                            "PC Connection: ${_peerConnection?.connectionState}",
+                          );
+                          log(
+                            "Queued candidates: ${_remoteCandidatesQueue.length}",
+                          );
+                          log("==================");
+
+                          _showSnackBar("Debug info logged to console");
+                        },
+                        icon: const Icon(Icons.bug_report),
+                        label: const Text("Log Debug Info"),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange,
+                          foregroundColor: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        "Status: ${connected ? 'Connected' : 'Disconnected'}${registered ? ' & Registered' : ''}",
+                        style: TextStyle(
+                          color: connected
+                              ? (registered ? Colors.green : Colors.orange)
+                              : Colors.red,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      if (socketId != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          "Socket ID: $socketId",
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
             ],
           ),
         ),
       ),
-      floatingActionButton: connected && !inCall && !_offerSent
+      floatingActionButton: (registered && !inCall && !offerSent)
           ? FloatingActionButton(
               onPressed: sendOffer,
               backgroundColor: Theme.of(context).colorScheme.secondary,
-              child: const Icon(Icons.videocam),
+              child: const Icon(Icons.videocam, color: Colors.white),
             )
           : null,
       bottomNavigationBar: incomingCall
@@ -1056,6 +1216,10 @@ class _VideoCallPageState extends State<VideoCallPage> {
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.green,
                           foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 32,
+                            vertical: 16,
+                          ),
                         ),
                       ),
                       ElevatedButton.icon(
@@ -1065,6 +1229,10 @@ class _VideoCallPageState extends State<VideoCallPage> {
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.redAccent,
                           foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 32,
+                            vertical: 16,
+                          ),
                         ),
                       ),
                     ],
