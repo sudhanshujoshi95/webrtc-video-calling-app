@@ -131,38 +131,62 @@ class _TelemedicineCallPageState extends State<TelemedicineCallPage> {
       return true;
     }
 
-    final statuses = await [Permission.camera, Permission.microphone].request();
-    final granted =
-        statuses[Permission.camera]!.isGranted &&
-        statuses[Permission.microphone]!.isGranted;
+    // For Android, we need to request camera and microphone permissions
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.camera,
+      Permission.microphone,
+      // Add storage permission if needed for recording
+      // Permission.storage,
+    ].request();
 
-    if (!granted) {
+    bool cameraGranted = statuses[Permission.camera] == PermissionStatus.granted;
+    bool micGranted = statuses[Permission.microphone] == PermissionStatus.granted;
+
+    if (!cameraGranted || !micGranted) {
       log("❌ Camera or microphone permissions denied");
       _showSnackBar("Camera and microphone permissions are required");
-    } else {
-      log("✅ Camera and microphone permissions granted");
+      return false;
     }
-    return granted;
+
+    log("✅ Camera and microphone permissions granted");
+    return true;
   }
 
   Future<void> openUserMedia() async {
     try {
-      final mediaConstraints = {
-        'audio': {
-          'echoCancellation': true,
-          'noiseSuppression': true,
-          'autoGainControl': true,
-        },
-        'video': {
-          'mandatory': {
-            'minWidth': '320',
-            'minHeight': '240',
-            'minFrameRate': '15',
-          },
-          'facingMode': 'user',
-          'optional': [],
-        },
-      };
+      // Different constraints for Web vs Android
+      final mediaConstraints = kIsWeb
+          ? {
+              'audio': {
+                'echoCancellation': true,
+                'noiseSuppression': true,
+                'autoGainControl': true,
+              },
+              'video': {
+                'mandatory': {
+                  'minWidth': '320',
+                  'minHeight': '240',
+                  'minFrameRate': '15',
+                },
+                'facingMode': 'user',
+                'optional': [],
+              },
+            }
+          : {
+              'audio': {
+                'echoCancellation': true,
+                'noiseSuppression': true,
+                'autoGainControl': true,
+              },
+              'video': {
+                'mandatory': {
+                  'minWidth': '320',
+                  'minHeight': '240',
+                  'minFrameRate': '15',
+                },
+                'facingMode': 'user',
+              },
+            };
 
       _localStream = await webrtc.navigator.mediaDevices.getUserMedia(
         mediaConstraints,
@@ -192,6 +216,7 @@ class _TelemedicineCallPageState extends State<TelemedicineCallPage> {
       _peerConnection = null;
     }
 
+    // Android-specific configuration
     final configuration = {
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
@@ -201,9 +226,23 @@ class _TelemedicineCallPageState extends State<TelemedicineCallPage> {
           'username': 'openrelayproject',
           'credential': 'openrelayproject',
         },
+        {
+          'urls': 'turn:openrelay.metered.ca:443',
+          'username': 'openrelayproject',
+          'credential': 'openrelayproject',
+          'turnTransport': 'tcp',
+        },
+        {
+          'urls': 'turn:openrelay.metered.ca:443?transport=tcp',
+          'username': 'openrelayproject',
+          'credential': 'openrelayproject',
+        },
       ],
       'sdpSemantics': 'unified-plan',
-      'offerExtmapAllowMixed': false,
+      // Android-specific configuration
+      'bundlePolicy': 'max-bundle',
+      'rtcpMuxPolicy': 'require',
+      'iceTransportPolicy': 'all',
     };
 
     try {
@@ -282,6 +321,16 @@ class _TelemedicineCallPageState extends State<TelemedicineCallPage> {
           log("➡️ ICE candidate sent to ${_targetController.text}");
         }
       };
+
+      // Handle signaling state changes
+      _peerConnection!.onSignalingState = (state) {
+        log("📶 Signaling State: $state");
+      };
+
+      // Handle ice gathering state changes
+      _peerConnection!.onIceGatheringState = (state) {
+        log("🧊 ICE Gathering State: $state");
+      };
     } catch (e) {
       log("❌ Failed to create peer connection: $e");
       _showSnackBar("Failed to create peer connection: $e");
@@ -310,7 +359,6 @@ class _TelemedicineCallPageState extends State<TelemedicineCallPage> {
       // Add connection timeout and better error handling
       _channel = WebSocketChannel.connect(
         Uri.parse(wsUrl),
-        protocols: ['websocket'], // Specify WebSocket protocol
       );
 
       // Wait for connection to establish before setting connected=true
@@ -516,7 +564,7 @@ class _TelemedicineCallPageState extends State<TelemedicineCallPage> {
       log("📩 Received ICE candidate from ${data['from']}");
 
       if (_peerConnection != null &&
-          _peerConnection!.getRemoteDescription() != null) {
+         (await _peerConnection!.getRemoteDescription() != null)) {
         try {
           await _peerConnection!.addCandidate(candidate);
           log("✅ ICE candidate added immediately");
@@ -619,7 +667,7 @@ class _TelemedicineCallPageState extends State<TelemedicineCallPage> {
 
       setState(() {
         incomingCall = false;
-        inCall = false;
+        inCall = true; // Changed from false to true
         _targetController.text = fromUser;
       });
 
